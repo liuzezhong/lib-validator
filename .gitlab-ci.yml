@@ -1,0 +1,99 @@
+stages:
+  - build
+  - test
+  - upload
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_HOST: tcp://docker:2375
+
+build-lib:
+  stage: build
+  image: ${LKI_HARBOR_HOST}/utils/node-tools:${CICD_NODE_TOOLS_IMAGE_TAG}
+  before_script:
+    - echo "${GITLAB_CLIENT_KEY}" > "$(pwd)/gitlab-client-key.pem"
+    - echo "${GITLAB_CLIENT_CERT}" > "$(pwd)/gitlab-client-cert.pem"
+    - git config --global http.sslKey "$(pwd)/gitlab-client-key.pem"
+    - git config --global http.sslCert "$(pwd)/gitlab-client-cert.pem"
+    - git config --global http.sslVerify "false"
+    - git config --global url."https://oauth2:${GITLAB_PRIVATE_TOKEN}@gitlab.lakeel.com/".insteadOf "https://gitlab.lakeel.com/"
+    - git config --global url."https://oauth2:${GITLAB_PRIVATE_TOKEN}@git.cicd.lakeelcloud.com/".insteadOf "https://git.cicd.lakeelcloud.com/"
+  script:
+    - if [ -n "${CI_COMMIT_TAG}" ]; then
+        VERSION=${CI_COMMIT_TAG};
+      elif [ "public" = ${CI_COMMIT_REF_NAME} ]; then
+        VERSION=$(cat package.json | jq -r .version);
+      else
+        VERSION=$(cat package.json | jq -r .version)-${CI_COMMIT_REF_SLUG};
+      fi
+    - yarn cache clean && yarn install --update-checksums --ignore-engines --production=false
+    - yarn run build
+    - mkdir -p target
+    - yarn pack --filename target/${CI_PROJECT_NAME}@${VERSION}.tgz
+  artifacts:
+    name: ${CI_PROJECT_NAME}
+    paths:
+      - target/*.tgz
+    expire_in: 3 mins
+  tags:
+    - docker
+  only:
+    refs:
+      - public
+      - tags
+
+check-vulnerabilities-and-licenses:
+  stage: test
+  image: ${LKI_HARBOR_HOST}/utils/whitesource-cli-tools:${CICD_WHITESOURCE_CLI_TOOLS_IMAGE_TAG}
+  script:
+    - java -jar /opt/whitesource/wss-unified-agent.jar -c ${WHITESOURCE_CONFIG_FILE}
+      -wss.url https://${WHITESOURCE_DOMAIN}/agent 
+      -apiKey ${WHITESOURCE_API_KEY}
+      -userKey ${WHITESOURCE_USER_KEY}
+      -productToken ${WHITESOURCE_PRODUCT_TOKEN_LAKEEL_LIBRARY}
+      -project ${CI_PROJECT_NAME}
+      -projectVersion $(cat package.json | jq -r .version)
+  tags:
+    - whitesource
+  when: manual
+  allow_failure: true
+  only:
+    refs:
+      - /^feature.*$/
+      - develop
+      - tags
+
+upload-lib:
+  stage: upload
+  image: ${LKI_HARBOR_HOST}/utils/deployment-cli-tools:${CICD_DEPLOYMENT_CLI_TOOLS_IMAGE_TAG}
+  before_script:
+    - aws configure set default.aws_access_key_id ${MANAGER_PRODUCTION_AWS_ACCESS_KEY_ID}
+    - aws configure set default.aws_secret_access_key ${MANAGER_PRODUCTION_AWS_SECRET_ACCESS_KEY}
+    - aws configure set default.region ${MANAGER_PRODUCTION_EKS_CLUSTER_REGION}
+    - aws configure set default.output json
+  script:
+    - aws s3 cp target/*.tgz s3://${MANAGER_PRODUCTION_LIBS_PUBLIC_BUCKET_NAME}/
+  tags:
+    - docker
+  only:
+    refs:
+      - public
+
+pages:
+  stage: deploy
+  image: ${LKI_HARBOR_HOST}/utils/deployment-cli-tools:${CICD_DEPLOYMENT_CLI_TOOLS_IMAGE_TAG}
+  before_script:
+  - VERSION=$(cat package.json | jq -r .version)
+  script:
+    - mkdir -p .public/${VERSION}
+    - cp -r docs/${VERSION}/* .public/${VERSION}
+    - mv .public public
+    - "echo \"User-Agent: *\nDisallow: /\" > ./public/robots.txt"
+  artifacts:
+    paths:
+      - public
+  only:
+    - master
+  tags:
+    - docker
